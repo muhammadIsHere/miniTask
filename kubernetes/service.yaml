@@ -2,10 +2,13 @@ apiVersion: v1
 kind: Service
 metadata:
   name: minitasks-api-service
+  labels:
+    app: minitasks
 spec:
-  selector:
-    app: minitasks-api
+  type: LoadBalancer
   ports:
   - port: 80
     targetPort: 5000
-  type: LoadBalancer 
+    protocol: TCP
+  selector:
+    app: minitasks 
