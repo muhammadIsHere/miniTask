@@ -21,10 +21,28 @@ app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# Initialize Pub/Sub client
-project_id = os.getenv('GCP_PROJECT')
+# Initialize Pub/Sub publisher
+project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
 publisher = pubsub_v1.PublisherClient()
-topic_path = publisher.topic_path(project_id, 'task-reminders')
+topic_name = f'projects/{project_id}/topics/task-reminders'
+
+def publish_reminder(task_id, due_date, description):
+    """Publish a task reminder to Pub/Sub"""
+    if not due_date:
+        return
+    
+    try:
+        message_data = json.dumps({
+            'task_id': task_id,
+            'due_date': due_date.isoformat() if isinstance(due_date, datetime) else due_date,
+            'description': description
+        }).encode('utf-8')
+        
+        future = publisher.publish(topic_name, message_data)
+        message_id = future.result()
+        logger.info(f"Published reminder for task {task_id} with message ID: {message_id}")
+    except Exception as e:
+        logger.error(f"Error publishing reminder: {e}")
 
 class Task(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -32,51 +50,26 @@ class Task(db.Model):
     description = db.Column(db.String(500))
     status = db.Column(db.String(20), default='pending')  # pending, in-progress, completed
     priority = db.Column(db.Integer, default=1)  # 1 (low) to 5 (high)
-    due_date = db.Column(db.Date, nullable=True)  # New field for due date
+    due_date = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     def to_dict(self):
-        task_dict = {
+        return {
             'id': self.id,
             'title': self.title,
             'description': self.description,
             'status': self.status,
             'priority': self.priority,
+            'due_date': self.due_date.isoformat() if self.due_date else None,
             'created_at': self.created_at.isoformat(),
             'updated_at': self.updated_at.isoformat()
         }
-        
-        if self.due_date:
-            task_dict['due_date'] = self.due_date.isoformat()
-            
-        return task_dict
 
 # Create tables if they don't exist
 with app.app_context():
     db.create_all()
     logger.info(f"Database initialized at {db_path}")
-
-def publish_reminder(task):
-    """Publish reminder message to Pub/Sub if task has a due date"""
-    if task.due_date:
-        message_data = {
-            'task_id': task.id,
-            'description': task.description,
-            'due_date': task.due_date.isoformat() if task.due_date else None
-        }
-        
-        # Convert message to JSON string and then to bytes
-        message_json = json.dumps(message_data)
-        message_bytes = message_json.encode('utf-8')
-        
-        try:
-            # Publish message
-            future = publisher.publish(topic_path, data=message_bytes)
-            message_id = future.result()
-            logger.info(f"Published reminder for task {task.id}, message ID: {message_id}")
-        except Exception as e:
-            logger.error(f"Error publishing reminder: {e}")
 
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
@@ -108,26 +101,28 @@ def create_task():
     if not data or 'title' not in data:
         return jsonify({'error': 'Title is required'}), 400
     
+    # Process due_date if provided
+    due_date = None
+    if 'due_date' in data and data['due_date']:
+        try:
+            due_date = datetime.fromisoformat(data['due_date'].replace('Z', '+00:00'))
+        except ValueError:
+            return jsonify({'error': 'Invalid due_date format. Use ISO format (YYYY-MM-DDTHH:MM:SS)'}), 400
+    
     new_task = Task(
         title=data['title'],
         description=data.get('description', ''),
         status=data.get('status', 'pending'),
-        priority=data.get('priority', 1)
+        priority=data.get('priority', 1),
+        due_date=due_date
     )
-    
-    # Add due_date if provided
-    if 'due_date' in data and data['due_date']:
-        try:
-            new_task.due_date = datetime.fromisoformat(data['due_date']).date()
-        except ValueError:
-            return jsonify({'error': 'Invalid date format. Use ISO format (YYYY-MM-DD)'}), 400
     
     db.session.add(new_task)
     db.session.commit()
     
-    # Publish reminder if task has due date
-    if new_task.due_date:
-        publish_reminder(new_task)
+    # Publish reminder if due_date is set
+    if due_date:
+        publish_reminder(new_task.id, due_date, new_task.description)
     
     return jsonify(new_task.to_dict()), 201
 
@@ -137,6 +132,8 @@ def update_task(task_id):
     task = Task.query.get_or_404(task_id)
     data = request.get_json()
     
+    due_date_changed = False
+    
     if 'title' in data:
         task.title = data['title']
     if 'description' in data:
@@ -145,24 +142,23 @@ def update_task(task_id):
         task.status = data['status']
     if 'priority' in data:
         task.priority = data['priority']
-    
-    # Update due_date if provided
-    due_date_updated = False
     if 'due_date' in data:
         if data['due_date']:
             try:
-                task.due_date = datetime.fromisoformat(data['due_date']).date()
-                due_date_updated = True
+                new_due_date = datetime.fromisoformat(data['due_date'].replace('Z', '+00:00'))
+                due_date_changed = task.due_date != new_due_date
+                task.due_date = new_due_date
             except ValueError:
-                return jsonify({'error': 'Invalid date format. Use ISO format (YYYY-MM-DD)'}), 400
+                return jsonify({'error': 'Invalid due_date format. Use ISO format (YYYY-MM-DDTHH:MM:SS)'}), 400
         else:
+            due_date_changed = task.due_date is not None
             task.due_date = None
     
     db.session.commit()
     
-    # Publish reminder if due date was updated and task has a due date
-    if due_date_updated and task.due_date:
-        publish_reminder(task)
+    # Publish reminder if due_date was changed and is set
+    if due_date_changed and task.due_date:
+        publish_reminder(task.id, task.due_date, task.description)
     
     return jsonify(task.to_dict())
 
