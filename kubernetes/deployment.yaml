@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minitasks-api
+  labels:
+    app: minitasks-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: minitasks-api
+  template:
+    metadata:
+      labels:
+        app: minitasks-api
+    spec:
+      containers:
+      - name: minitasks-api
+        image: us-central1-docker.pkg.dev/cs436-minitasks/minitasks-repo/minitasks-api:v1
+        ports:
+        - containerPort: 5000
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+        env:
+        - name: DB_PATH
+          value: "/app/data/minitasks.db"
+        volumeMounts:
+        - name: db-storage
+          mountPath: /app/data
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 5000
+          initialDelaySeconds: 15
+          periodSeconds: 20
+      volumes:
+      - name: db-storage
+        persistentVolumeClaim:
+          claimName: minitasks-db-pvc 
