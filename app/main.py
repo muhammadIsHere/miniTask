@@ -22,7 +22,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
 # Initialize Pub/Sub publisher
-project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+project_id = os.getenv('GOOGLE_CLOUD_PROJECT', 'cs436-minitasks')  # Default to cs436-minitasks if env var not set
 publisher = pubsub_v1.PublisherClient()
 topic_name = f'projects/{project_id}/topics/task-reminders'
 
