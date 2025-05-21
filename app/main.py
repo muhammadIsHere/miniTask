@@ -1,88 +1,71 @@
 import os
+import json
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.exc import SQLAlchemyError
-import datetime
+from datetime import datetime
+import logging
 
-# Create Flask application
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
-# Configure database path - handle both local and container environments
-db_path = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
-os.makedirs(db_path, exist_ok=True)  # Ensure the directory exists
-db_file = os.path.join(db_path, 'minitasks.db')
+# Get database path - use /app/data/minitasks.db in container
+# or a local path for development
+db_path = os.getenv('DB_PATH', os.path.join(os.path.dirname(__file__), '..', 'data', 'minitasks.db'))
+os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-# Configure SQLAlchemy
-app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_file}'
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# Define Task model
 class Task(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(100), nullable=False)
     description = db.Column(db.String(500))
-    completed = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
-
+    status = db.Column(db.String(20), default='pending')  # pending, in-progress, completed
+    priority = db.Column(db.Integer, default=1)  # 1 (low) to 5 (high)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
     def to_dict(self):
         return {
             'id': self.id,
             'title': self.title,
             'description': self.description,
-            'completed': self.completed,
+            'status': self.status,
+            'priority': self.priority,
             'created_at': self.created_at.isoformat(),
             'updated_at': self.updated_at.isoformat()
         }
 
-# Create database tables
+# Create tables if they don't exist
 with app.app_context():
     db.create_all()
+    logger.info(f"Database initialized at {db_path}")
 
-# API Routes
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
-    """Get all tasks or filter by completion status"""
-    completed = request.args.get('completed')
+    """Get all tasks with optional filtering"""
+    status = request.args.get('status')
+    priority = request.args.get('priority')
     
-    try:
-        if completed is not None:
-            completed = completed.lower() == 'true'
-            tasks = Task.query.filter_by(completed=completed).all()
-        else:
-            tasks = Task.query.all()
-            
-        return jsonify({
-            'status': 'success',
-            'tasks': [task.to_dict() for task in tasks]
-        }), 200
-    except SQLAlchemyError as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+    query = Task.query
+    
+    if status:
+        query = query.filter_by(status=status)
+    if priority:
+        query = query.filter_by(priority=int(priority))
+        
+    tasks = query.order_by(Task.created_at.desc()).all()
+    return jsonify([task.to_dict() for task in tasks])
 
 @app.route('/api/tasks/<int:task_id>', methods=['GET'])
 def get_task(task_id):
-    """Get a single task by ID"""
-    try:
-        task = Task.query.get(task_id)
-        if task is None:
-            return jsonify({
-                'status': 'error',
-                'message': f'Task with ID {task_id} not found'
-            }), 404
-            
-        return jsonify({
-            'status': 'success',
-            'task': task.to_dict()
-        }), 200
-    except SQLAlchemyError as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+    """Get a specific task by ID"""
+    task = Task.query.get_or_404(task_id)
+    return jsonify(task.to_dict())
 
 @app.route('/api/tasks', methods=['POST'])
 def create_task():
@@ -90,107 +73,65 @@ def create_task():
     data = request.get_json()
     
     if not data or 'title' not in data:
-        return jsonify({
-            'status': 'error',
-            'message': 'Title is required'
-        }), 400
-        
-    try:
-        task = Task(
-            title=data['title'],
-            description=data.get('description', ''),
-            completed=data.get('completed', False)
-        )
-        
-        db.session.add(task)
-        db.session.commit()
-        
-        return jsonify({
-            'status': 'success',
-            'message': 'Task created successfully',
-            'task': task.to_dict()
-        }), 201
-    except SQLAlchemyError as e:
-        db.session.rollback()
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+        return jsonify({'error': 'Title is required'}), 400
+    
+    new_task = Task(
+        title=data['title'],
+        description=data.get('description', ''),
+        status=data.get('status', 'pending'),
+        priority=data.get('priority', 1)
+    )
+    
+    db.session.add(new_task)
+    db.session.commit()
+    
+    return jsonify(new_task.to_dict()), 201
 
 @app.route('/api/tasks/<int:task_id>', methods=['PUT'])
 def update_task(task_id):
     """Update an existing task"""
+    task = Task.query.get_or_404(task_id)
     data = request.get_json()
     
-    if not data:
-        return jsonify({
-            'status': 'error',
-            'message': 'No data provided'
-        }), 400
-        
-    try:
-        task = Task.query.get(task_id)
-        if task is None:
-            return jsonify({
-                'status': 'error',
-                'message': f'Task with ID {task_id} not found'
-            }), 404
-            
-        # Update fields if they exist in the request
-        if 'title' in data:
-            task.title = data['title']
-        if 'description' in data:
-            task.description = data['description']
-        if 'completed' in data:
-            task.completed = data['completed']
-            
-        task.updated_at = datetime.datetime.utcnow()
-        db.session.commit()
-        
-        return jsonify({
-            'status': 'success',
-            'message': 'Task updated successfully',
-            'task': task.to_dict()
-        }), 200
-    except SQLAlchemyError as e:
-        db.session.rollback()
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+    if 'title' in data:
+        task.title = data['title']
+    if 'description' in data:
+        task.description = data['description']
+    if 'status' in data:
+        task.status = data['status']
+    if 'priority' in data:
+        task.priority = data['priority']
+    
+    db.session.commit()
+    return jsonify(task.to_dict())
 
 @app.route('/api/tasks/<int:task_id>', methods=['DELETE'])
 def delete_task(task_id):
     """Delete a task"""
-    try:
-        task = Task.query.get(task_id)
-        if task is None:
-            return jsonify({
-                'status': 'error',
-                'message': f'Task with ID {task_id} not found'
-            }), 404
-            
-        db.session.delete(task)
-        db.session.commit()
-        
-        return jsonify({
-            'status': 'success',
-            'message': f'Task with ID {task_id} deleted successfully'
-        }), 200
-    except SQLAlchemyError as e:
-        db.session.rollback()
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+    task = Task.query.get_or_404(task_id)
+    db.session.delete(task)
+    db.session.commit()
+    return jsonify({'message': f'Task {task_id} deleted successfully'}), 200
+
+@app.route('/api/tasks/status/<status>', methods=['GET'])
+def get_tasks_by_status(status):
+    """Get tasks filtered by status"""
+    tasks = Task.query.filter_by(status=status).all()
+    return jsonify([task.to_dict() for task in tasks])
+
+@app.route('/api/tasks/priority/<int:priority>', methods=['GET'])
+def get_tasks_by_priority(priority):
+    """Get tasks filtered by priority"""
+    tasks = Task.query.filter_by(priority=priority).all()
+    return jsonify([task.to_dict() for task in tasks])
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({
-        'status': 'success',
-        'message': 'API is running'
-    }), 200
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat()
+    })
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000) 
+    app.run(debug=True, host='0.0.0.0', port=int(os.getenv('PORT', 5000))) 
