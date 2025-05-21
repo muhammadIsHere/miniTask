@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minitasks-api-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: minitasks-api
+  template:
+    metadata:
+      labels:
+        app: minitasks-api
+    spec:
+      containers:
+      - name: minitasks-api
+        image: us-central1-docker.pkg.dev/cs436-minitasks/minitasks-repo/minitasks-api:v2
+        ports:
+        - containerPort: 5000
+        env:
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "cs436-minitasks" 
